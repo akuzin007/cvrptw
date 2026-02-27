@@ -1,0 +1,104 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Lines Visualization</title>
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body { background: #0f172a; overflow: hidden; }
+        canvas { width: 100%; height: 100vh; display: block; }
+    </style>
+</head>
+<body>
+    <canvas id="canvas"></canvas>
+    
+    <script>
+        let sequence = [];
+        let particles = [];
+        let canvas, ctx;
+
+        // Слушаем сообщения от родительской страницы
+        window.addEventListener('message', (event) => {
+            if (event.data.type === 'UPDATE_SEQUENCE') {
+                sequence = event.data.sequence;
+                initParticles();
+            }
+        });
+
+        function initCanvas() {
+            canvas = document.getElementById('canvas');
+            ctx = canvas.getContext('2d');
+            resizeCanvas();
+            window.addEventListener('resize', resizeCanvas);
+            animate();
+        }
+
+        function resizeCanvas() {
+            canvas.width = window.innerWidth;
+            canvas.height = window.innerHeight;
+            if (sequence.length > 0) {
+                initParticles();
+            }
+        }
+
+        function initParticles() {
+            particles = sequence.map((val, i) => ({
+                x: val * canvas.width,
+                y: sequence[(i + 1) % sequence.length] * canvas.height,
+                vx: (sequence[(i + 2) % sequence.length] - 0.5) * 3,
+                vy: (sequence[(i + 3) % sequence.length] - 0.5) * 3,
+                hue: Math.floor(val * 360)
+            }));
+        }
+
+        function animate() {
+            // Полупрозрачный фон для эффекта следа
+            ctx.fillStyle = 'rgba(15, 23, 42, 0.15)';
+            ctx.fillRect(0, 0, canvas.width, canvas.height);
+
+            particles.forEach((p, i) => {
+                // Движение
+                p.x += p.vx;
+                p.y += p.vy;
+
+                // Отражение от границ
+                if (p.x < 0 || p.x > canvas.width) p.vx *= -1;
+                if (p.y < 0 || p.y > canvas.height) p.vy *= -1;
+
+                // Ограничиваем позицию
+                p.x = Math.max(0, Math.min(canvas.width, p.x));
+                p.y = Math.max(0, Math.min(canvas.height, p.y));
+
+                // Соединяем близкие частицы линиями
+                particles.forEach((p2, j) => {
+                    if (i >= j) return;
+                    
+                    const dx = p.x - p2.x;
+                    const dy = p.y - p2.y;
+                    const dist = Math.sqrt(dx * dx + dy * dy);
+
+                    if (dist < 120) {
+                        ctx.beginPath();
+                        ctx.moveTo(p.x, p.y);
+                        ctx.lineTo(p2.x, p2.y);
+                        ctx.strokeStyle = `hsla(${(p.hue + p2.hue) / 2}, 60%, 50%, ${1 - dist / 120})`;
+                        ctx.lineWidth = 2;
+                        ctx.stroke();
+                    }
+                });
+
+                // Рисуем точку
+                ctx.beginPath();
+                ctx.arc(p.x, p.y, 4, 0, Math.PI * 2);
+                ctx.fillStyle = `hsl(${p.hue}, 70%, 60%)`;
+                ctx.fill();
+            });
+
+            requestAnimationFrame(animate);
+        }
+
+        initCanvas();
+    </script>
+</body>
+</html>

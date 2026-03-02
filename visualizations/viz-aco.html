@@ -1,0 +1,454 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Optimal CVRP Visualization</title>
+    <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+    <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body { background: #0f172a; overflow: hidden; }
+        #map { width: 100%; height: 100vh; }
+        
+        .info-box {
+            position: absolute;
+            top: 10px;
+            left: 10px;
+            background: rgba(15, 23, 42, 0.95);
+            padding: 12px 16px;
+            border-radius: 10px;
+            color: #e2e8f0;
+            font-family: -apple-system, sans-serif;
+            font-size: 0.8rem;
+            z-index: 1000;
+            min-width: 200px;
+        }
+        
+        .info-box h4 {
+            margin-bottom: 8px;
+            color: #f59e0b;
+            font-size: 0.85rem;
+        }
+        
+        .stat {
+            display: flex;
+            justify-content: space-between;
+            margin: 4px 0;
+        }
+        
+        .stat .label { color: #94a3b8; }
+        .stat .value { font-family: Monaco, monospace; color: #e2e8f0; }
+        
+        .progress-section {
+            margin-top: 10px;
+            padding-top: 10px;
+            border-top: 1px solid #334155;
+        }
+        
+        .progress-bar {
+            height: 6px;
+            background: #334155;
+            border-radius: 3px;
+            overflow: hidden;
+            margin-top: 6px;
+        }
+        
+        .progress-bar .fill {
+            height: 100%;
+            background: linear-gradient(90deg, #f59e0b, #fbbf24);
+            transition: width 0.3s;
+        }
+        
+        .cost-highlight {
+            margin-top: 10px;
+            padding: 8px;
+            background: rgba(245, 158, 11, 0.2);
+            border-radius: 6px;
+            text-align: center;
+        }
+        
+        .cost-highlight .amount {
+            font-size: 1.1rem;
+            font-weight: bold;
+            color: #fbbf24;
+            font-family: Monaco, monospace;
+        }
+    </style>
+</head>
+<body>
+    <div id="map"></div>
+    <div class="info-box">
+        <h4>📦 Оптимальный алгоритм (3+ маг./машина)</h4>
+        <div class="stat">
+            <span class="label">День:</span>
+            <span class="value"><span id="currentDay">—</span> / 30</span>
+        </div>
+        <div class="stat">
+            <span class="label">Машин сегодня:</span>
+            <span class="value" id="trucksToday">—</span>
+        </div>
+        <div class="stat">
+            <span class="label">Км сегодня:</span>
+            <span class="value"><span id="distToday">—</span></span>
+        </div>
+        <div class="stat">
+            <span class="label">Стоимость дня:</span>
+            <span class="value"><span id="costToday">—</span> ₽</span>
+        </div>
+        <div class="progress-section">
+            <div class="stat">
+                <span class="label">Прогресс:</span>
+                <span class="value"><span id="progress">0</span>%</span>
+            </div>
+            <div class="progress-bar">
+                <div class="fill" id="progressBar" style="width: 0%"></div>
+            </div>
+        </div>
+        <div class="cost-highlight">
+            <div style="color: #94a3b8; font-size: 0.75rem;">Накопленная стоимость</div>
+            <div class="amount" id="totalCost">0 ₽</div>
+        </div>
+    </div>
+
+    <script>
+        let map = null;
+        let depot = null;
+        let stores = [];
+        let pallets = {};
+        let speed = 5;
+        let markers = [];
+        let routeLines = [];
+
+        const routeColors = [
+            '#f59e0b', '#ef4444', '#8b5cf6', '#06b6d4', 
+            '#10b981', '#ec4899', '#3b82f6', '#6366f1',
+            '#14b8a6', '#f97316', '#a855f7', '#22c55e'
+        ];
+
+        function initMap() {
+            map = L.map('map', {
+                zoomControl: false,
+                attributionControl: false
+            }).setView([55.55, 37.7], 11);
+
+            L.tileLayer('https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png', {
+                maxZoom: 19
+            }).addTo(map);
+        }
+
+        function clearMap() {
+            markers.forEach(m => map.removeLayer(m));
+            routeLines.forEach(l => map.removeLayer(l));
+            markers = [];
+            routeLines = [];
+        }
+
+        // Расстояние в км (с коэффициентом кривизны дорог 1.45)
+        function distance(p1, p2) {
+            const R = 6371;
+            const ROAD_COEFFICIENT = 1.45; // коэффициент кривизны дорог
+            const dLat = (p2.lat - p1.lat) * Math.PI / 180;
+            const dLng = (p2.lng - p1.lng) * Math.PI / 180;
+            const a = Math.sin(dLat/2) * Math.sin(dLat/2) +
+                      Math.cos(p1.lat * Math.PI / 180) * Math.cos(p2.lat * Math.PI / 180) *
+                      Math.sin(dLng/2) * Math.sin(dLng/2);
+            const straightLine = R * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1-a));
+            return straightLine * ROAD_COEFFICIENT;
+        }
+
+        function freightCost(distKm) {
+            return 98.49 * Math.pow(distKm, 0.9094) + 5899;
+        }
+
+        // ACO для CVRP (Capacitated VRP)
+        function solveCVRP_ACO(depot, stores, demands, capacity) {
+            const n = stores.length;
+            if (n === 0) return { routes: [], totalDist: 0 };
+            
+            const numAnts = n * 2; // муравьёв = количество магазинов × 2
+            const numIterations = 50;
+            const alpha = 1.0;
+            const beta = 3.0;
+            const evaporation = 0.3;
+            const Q = 100;
+            
+            // Матрица расстояний (depot = index 0)
+            const allPoints = [depot, ...stores];
+            const distMatrix = [];
+            for (let i = 0; i < allPoints.length; i++) {
+                distMatrix[i] = [];
+                for (let j = 0; j < allPoints.length; j++) {
+                    distMatrix[i][j] = distance(allPoints[i], allPoints[j]);
+                }
+            }
+            
+            // Феромоны
+            const pheromone = [];
+            for (let i = 0; i < allPoints.length; i++) {
+                pheromone[i] = [];
+                for (let j = 0; j < allPoints.length; j++) {
+                    pheromone[i][j] = 1.0;
+                }
+            }
+            
+            let bestSolution = null;
+            let bestTotalDist = Infinity;
+            
+            for (let iter = 0; iter < numIterations; iter++) {
+                const antSolutions = [];
+                
+                for (let ant = 0; ant < numAnts; ant++) {
+                    const routes = [];
+                    const unvisited = new Set(stores.map((_, i) => i + 1)); // 1-indexed
+                    
+                    while (unvisited.size > 0) {
+                        const route = [];
+                        let currentIdx = 0; // depot
+                        let currentLoad = 0;
+                        
+                        while (unvisited.size > 0) {
+                            // Выбираем следующую точку с учётом вместимости
+                            const candidates = [];
+                            let probSum = 0;
+                            
+                            for (const idx of unvisited) {
+                                const demand = demands[idx - 1];
+                                if (currentLoad + demand <= capacity) {
+                                    const tau = Math.pow(pheromone[currentIdx][idx], alpha);
+                                    const eta = Math.pow(1 / (distMatrix[currentIdx][idx] + 0.001), beta);
+                                    const prob = tau * eta;
+                                    candidates.push({ idx, prob, demand });
+                                    probSum += prob;
+                                }
+                            }
+                            
+                            if (candidates.length === 0) break;
+                            
+                            // Рулеточный выбор
+                            let r = Math.random() * probSum;
+                            let selected = candidates[0];
+                            
+                            for (const c of candidates) {
+                                r -= c.prob;
+                                if (r <= 0) {
+                                    selected = c;
+                                    break;
+                                }
+                            }
+                            
+                            route.push(selected.idx);
+                            currentLoad += selected.demand;
+                            unvisited.delete(selected.idx);
+                            currentIdx = selected.idx;
+                        }
+                        
+                        if (route.length > 0) {
+                            routes.push(route);
+                        }
+                    }
+                    
+                    // Вычисляем общую дистанцию
+                    let totalDist = 0;
+                    for (const route of routes) {
+                        totalDist += distMatrix[0][route[0]]; // depot -> first
+                        for (let i = 0; i < route.length - 1; i++) {
+                            totalDist += distMatrix[route[i]][route[i + 1]];
+                        }
+                        totalDist += distMatrix[route[route.length - 1]][0]; // last -> depot
+                    }
+                    
+                    antSolutions.push({ routes, totalDist });
+                    
+                    if (totalDist < bestTotalDist) {
+                        bestTotalDist = totalDist;
+                        bestSolution = routes.map(r => [...r]);
+                    }
+                }
+                
+                // Испарение
+                for (let i = 0; i < allPoints.length; i++) {
+                    for (let j = 0; j < allPoints.length; j++) {
+                        pheromone[i][j] *= (1 - evaporation);
+                    }
+                }
+                
+                // Обновление феромонов
+                for (const sol of antSolutions) {
+                    const deposit = Q / sol.totalDist;
+                    for (const route of sol.routes) {
+                        pheromone[0][route[0]] += deposit;
+                        for (let i = 0; i < route.length - 1; i++) {
+                            pheromone[route[i]][route[i + 1]] += deposit;
+                        }
+                        pheromone[route[route.length - 1]][0] += deposit;
+                    }
+                }
+                
+                // Элитный бонус
+                if (bestSolution) {
+                    const eliteDeposit = Q / bestTotalDist * 2;
+                    for (const route of bestSolution) {
+                        pheromone[0][route[0]] += eliteDeposit;
+                        for (let i = 0; i < route.length - 1; i++) {
+                            pheromone[route[i]][route[i + 1]] += eliteDeposit;
+                        }
+                        pheromone[route[route.length - 1]][0] += eliteDeposit;
+                    }
+                }
+            }
+            
+            // Конвертируем индексы в магазины
+            const finalRoutes = bestSolution.map(route => 
+                route.map(idx => stores[idx - 1])
+            );
+            
+            return { routes: finalRoutes, totalDist: bestTotalDist };
+        }
+
+        // Расчёт стоимости дня
+        function calculateDayCost(stores, pallets, day) {
+            // Спрос на день
+            const demands = stores.map(s => pallets[s.id][day]);
+            
+            // Решаем CVRP (вместимость 12 паллет)
+            const solution = solveCVRP_ACO(depot, stores, demands, 12);
+            
+            let totalDist = 0;
+            let totalCost = 0;
+            const routes = [];
+            
+            solution.routes.forEach((route, idx) => {
+                // Расстояние маршрута
+                let routeDist = distance(depot, route[0]);
+                for (let i = 0; i < route.length - 1; i++) {
+                    routeDist += distance(route[i], route[i + 1]);
+                }
+                routeDist += distance(route[route.length - 1], depot);
+                
+                const cost = freightCost(routeDist);
+                
+                totalDist += routeDist;
+                totalCost += cost;
+                
+                routes.push({
+                    stores: route,
+                    distance: routeDist,
+                    cost: cost,
+                    color: routeColors[idx % routeColors.length]
+                });
+            });
+            
+            return { 
+                totalDist, 
+                totalCost, 
+                trucks: solution.routes.length, 
+                routes 
+            };
+        }
+
+        // Отрисовка маршрутов
+        function drawRoutes(routes) {
+            routes.forEach(route => {
+                const points = [depot, ...route.stores, depot];
+                const latlngs = points.map(p => [p.lat, p.lng]);
+                
+                const line = L.polyline(latlngs, {
+                    color: route.color,
+                    weight: 3,
+                    opacity: 0.8
+                }).addTo(map);
+                
+                routeLines.push(line);
+            });
+        }
+
+        function addMarkers() {
+            const depotIcon = L.divIcon({
+                className: 'depot-marker',
+                html: '<div style="width:20px;height:20px;background:#f472b6;border:3px solid white;border-radius:50%;box-shadow:0 2px 8px rgba(0,0,0,0.4);"></div>',
+                iconSize: [20, 20],
+                iconAnchor: [10, 10]
+            });
+            const depotMarker = L.marker([depot.lat, depot.lng], { icon: depotIcon }).addTo(map);
+            markers.push(depotMarker);
+            
+            stores.forEach(store => {
+                const storeIcon = L.divIcon({
+                    className: 'store-marker',
+                    html: '<div style="width:14px;height:14px;background:#4ade80;border:2px solid white;border-radius:50%;box-shadow:0 2px 6px rgba(0,0,0,0.3);"></div>',
+                    iconSize: [14, 14],
+                    iconAnchor: [7, 7]
+                });
+                const marker = L.marker([store.lat, store.lng], { icon: storeIcon }).addTo(map);
+                markers.push(marker);
+            });
+            
+            const allPoints = [depot, ...stores];
+            const bounds = L.latLngBounds(allPoints.map(p => [p.lat, p.lng]));
+            map.fitBounds(bounds, { padding: [30, 30] });
+        }
+
+        async function runSimulation() {
+            let accumulatedCost = 0;
+            
+            for (let day = 0; day < 30; day++) {
+                const result = calculateDayCost(stores, pallets, day);
+                accumulatedCost += result.totalCost;
+                
+                document.getElementById('currentDay').textContent = day + 1;
+                document.getElementById('trucksToday').textContent = result.trucks;
+                document.getElementById('distToday').textContent = result.totalDist.toFixed(1);
+                document.getElementById('costToday').textContent = formatNumber(result.totalCost);
+                document.getElementById('totalCost').textContent = formatNumber(accumulatedCost) + ' ₽';
+                document.getElementById('progress').textContent = Math.round((day + 1) / 30 * 100);
+                document.getElementById('progressBar').style.width = ((day + 1) / 30 * 100) + '%';
+                
+                // Отрисовка только день 1
+                if (day === 0) {
+                    drawRoutes(result.routes);
+                }
+                
+                window.parent.postMessage({
+                    type: 'DAY_RESULT',
+                    algorithm: 'aco',
+                    day: day + 1,
+                    cost: result.totalCost,
+                    trucks: result.trucks,
+                    distance: result.totalDist
+                }, '*');
+                
+                if (day < 29) {
+                    await new Promise(resolve => setTimeout(resolve, 150 / speed));
+                }
+            }
+            
+            window.parent.postMessage({
+                type: 'SIMULATION_COMPLETE',
+                algorithm: 'aco',
+                totalCost: accumulatedCost
+            }, '*');
+        }
+
+        function formatNumber(num) {
+            return Math.round(num).toLocaleString('ru-RU');
+        }
+
+        window.addEventListener('message', (event) => {
+            if (event.data.type === 'INIT_SIMULATION') {
+                depot = event.data.depot;
+                stores = event.data.stores;
+                pallets = event.data.pallets;
+                speed = event.data.speed || 5;
+                
+                clearMap();
+                addMarkers();
+                
+                setTimeout(runSimulation, 500);
+            }
+        });
+
+        initMap();
+    </script>
+</body>
+</html>

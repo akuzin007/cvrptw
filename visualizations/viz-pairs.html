@@ -1,0 +1,367 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Pairs Visualization</title>
+    <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+    <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body { background: #0f172a; overflow: hidden; }
+        #map { width: 100%; height: 100vh; }
+        
+        .info-box {
+            position: absolute;
+            top: 10px;
+            left: 10px;
+            background: rgba(15, 23, 42, 0.95);
+            padding: 12px 16px;
+            border-radius: 10px;
+            color: #e2e8f0;
+            font-family: -apple-system, sans-serif;
+            font-size: 0.8rem;
+            z-index: 1000;
+            min-width: 200px;
+        }
+        
+        .info-box h4 {
+            margin-bottom: 8px;
+            color: #3b82f6;
+            font-size: 0.85rem;
+        }
+        
+        .stat {
+            display: flex;
+            justify-content: space-between;
+            margin: 4px 0;
+        }
+        
+        .stat .label { color: #94a3b8; }
+        .stat .value { font-family: Monaco, monospace; color: #e2e8f0; }
+        
+        .progress-section {
+            margin-top: 10px;
+            padding-top: 10px;
+            border-top: 1px solid #334155;
+        }
+        
+        .progress-bar {
+            height: 6px;
+            background: #334155;
+            border-radius: 3px;
+            overflow: hidden;
+            margin-top: 6px;
+        }
+        
+        .progress-bar .fill {
+            height: 100%;
+            background: linear-gradient(90deg, #3b82f6, #60a5fa);
+            transition: width 0.3s;
+        }
+        
+        .cost-highlight {
+            margin-top: 10px;
+            padding: 8px;
+            background: rgba(59, 130, 246, 0.2);
+            border-radius: 6px;
+            text-align: center;
+        }
+        
+        .cost-highlight .amount {
+            font-size: 1.1rem;
+            font-weight: bold;
+            color: #60a5fa;
+            font-family: Monaco, monospace;
+        }
+    </style>
+</head>
+<body>
+    <div id="map"></div>
+    <div class="info-box">
+        <h4>📦 Парная схема (2 маг./машина)</h4>
+        <div class="stat">
+            <span class="label">День:</span>
+            <span class="value"><span id="currentDay">—</span> / 30</span>
+        </div>
+        <div class="stat">
+            <span class="label">Машин сегодня:</span>
+            <span class="value" id="trucksToday">—</span>
+        </div>
+        <div class="stat">
+            <span class="label">Км сегодня:</span>
+            <span class="value"><span id="distToday">—</span></span>
+        </div>
+        <div class="stat">
+            <span class="label">Стоимость дня:</span>
+            <span class="value"><span id="costToday">—</span> ₽</span>
+        </div>
+        <div class="progress-section">
+            <div class="stat">
+                <span class="label">Прогресс:</span>
+                <span class="value"><span id="progress">0</span>%</span>
+            </div>
+            <div class="progress-bar">
+                <div class="fill" id="progressBar" style="width: 0%"></div>
+            </div>
+        </div>
+        <div class="cost-highlight">
+            <div style="color: #94a3b8; font-size: 0.75rem;">Накопленная стоимость</div>
+            <div class="amount" id="totalCost">0 ₽</div>
+        </div>
+    </div>
+
+    <script>
+        let map = null;
+        let depot = null;
+        let stores = [];
+        let pallets = {};
+        let speed = 5;
+        let markers = [];
+        let routeLines = [];
+
+        // Цвета для разных маршрутов
+        const routeColors = [
+            '#3b82f6', '#8b5cf6', '#06b6d4', '#10b981', 
+            '#f59e0b', '#ef4444', '#ec4899', '#6366f1'
+        ];
+
+        function initMap() {
+            map = L.map('map', {
+                zoomControl: false,
+                attributionControl: false
+            }).setView([55.55, 37.7], 11);
+
+            L.tileLayer('https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png', {
+                maxZoom: 19
+            }).addTo(map);
+        }
+
+        function clearMap() {
+            markers.forEach(m => map.removeLayer(m));
+            routeLines.forEach(l => map.removeLayer(l));
+            markers = [];
+            routeLines = [];
+        }
+
+        // Расстояние в км (с коэффициентом кривизны дорог 1.45)
+        function distance(p1, p2) {
+            const R = 6371;
+            const ROAD_COEFFICIENT = 1.45; // коэффициент кривизны дорог
+            const dLat = (p2.lat - p1.lat) * Math.PI / 180;
+            const dLng = (p2.lng - p1.lng) * Math.PI / 180;
+            const a = Math.sin(dLat/2) * Math.sin(dLat/2) +
+                      Math.cos(p1.lat * Math.PI / 180) * Math.cos(p2.lat * Math.PI / 180) *
+                      Math.sin(dLng/2) * Math.sin(dLng/2);
+            const straightLine = R * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1-a));
+            return straightLine * ROAD_COEFFICIENT;
+        }
+
+        // Стоимость фрахта
+        function freightCost(distKm) {
+            return 98.49 * Math.pow(distKm, 0.9094) + 5899;
+        }
+
+        // Создание пар магазинов (2 ближайших)
+        function createPairs(stores, depot) {
+            const sorted = [...stores].sort((a, b) => 
+                distance(depot, a) - distance(depot, b)
+            );
+            
+            const pairs = [];
+            const used = new Set();
+            
+            for (let i = 0; i < sorted.length; i++) {
+                if (used.has(sorted[i].id)) continue;
+                
+                // Ищем ближайшего непосещённого
+                let nearestIdx = -1;
+                let nearestDist = Infinity;
+                
+                for (let j = i + 1; j < sorted.length; j++) {
+                    if (used.has(sorted[j].id)) continue;
+                    const d = distance(sorted[i], sorted[j]);
+                    if (d < nearestDist) {
+                        nearestDist = d;
+                        nearestIdx = j;
+                    }
+                }
+                
+                if (nearestIdx !== -1) {
+                    pairs.push([sorted[i], sorted[nearestIdx]]);
+                    used.add(sorted[i].id);
+                    used.add(sorted[nearestIdx].id);
+                } else {
+                    // Одиночный (самый дальний)
+                    pairs.push([sorted[i]]);
+                    used.add(sorted[i].id);
+                }
+            }
+            
+            return pairs;
+        }
+
+        // Расчёт стоимости дня для парной схемы
+        function calculateDayCost(pairs, pallets, day) {
+            let totalDist = 0;
+            let totalCost = 0;
+            let trucks = 0;
+            const routes = [];
+            
+            pairs.forEach((pair, idx) => {
+                const store1 = pair[0];
+                const store2 = pair[1] || null;
+                
+                // Паллеты на день
+                const pallets1 = pallets[store1.id][day];
+                const pallets2 = store2 ? pallets[store2.id][day] : 0;
+                const totalPallets = pallets1 + pallets2;
+                
+                // Расстояние маршрута
+                let routeDist;
+                if (store2) {
+                    routeDist = distance(depot, store1) + distance(store1, store2) + distance(store2, depot);
+                } else {
+                    routeDist = distance(depot, store1) * 2;
+                }
+                
+                // Число машин (если >12 паллет — 2 машины)
+                const numTrucks = totalPallets > 12 ? 2 : 1;
+                
+                trucks += numTrucks;
+                totalDist += routeDist * numTrucks;
+                totalCost += freightCost(routeDist) * numTrucks;
+                
+                routes.push({
+                    stores: pair,
+                    distance: routeDist,
+                    trucks: numTrucks,
+                    pallets: totalPallets,
+                    cost: freightCost(routeDist) * numTrucks,
+                    color: routeColors[idx % routeColors.length]
+                });
+            });
+            
+            return { totalDist, totalCost, trucks, routes };
+        }
+
+        // Отрисовка маршрутов (только день 1)
+        function drawRoutes(routes) {
+            routes.forEach(route => {
+                const points = [depot];
+                route.stores.forEach(s => points.push(s));
+                points.push(depot);
+                
+                const latlngs = points.map(p => [p.lat, p.lng]);
+                
+                const line = L.polyline(latlngs, {
+                    color: route.color,
+                    weight: 3,
+                    opacity: 0.8
+                }).addTo(map);
+                
+                routeLines.push(line);
+            });
+        }
+
+        // Добавление маркеров
+        function addMarkers() {
+            // Депо
+            const depotIcon = L.divIcon({
+                className: 'depot-marker',
+                html: '<div style="width:20px;height:20px;background:#f472b6;border:3px solid white;border-radius:50%;box-shadow:0 2px 8px rgba(0,0,0,0.4);"></div>',
+                iconSize: [20, 20],
+                iconAnchor: [10, 10]
+            });
+            const depotMarker = L.marker([depot.lat, depot.lng], { icon: depotIcon }).addTo(map);
+            markers.push(depotMarker);
+            
+            // Магазины
+            stores.forEach(store => {
+                const storeIcon = L.divIcon({
+                    className: 'store-marker',
+                    html: '<div style="width:14px;height:14px;background:#4ade80;border:2px solid white;border-radius:50%;box-shadow:0 2px 6px rgba(0,0,0,0.3);"></div>',
+                    iconSize: [14, 14],
+                    iconAnchor: [7, 7]
+                });
+                const marker = L.marker([store.lat, store.lng], { icon: storeIcon }).addTo(map);
+                markers.push(marker);
+            });
+            
+            // Центрирование
+            const allPoints = [depot, ...stores];
+            const bounds = L.latLngBounds(allPoints.map(p => [p.lat, p.lng]));
+            map.fitBounds(bounds, { padding: [30, 30] });
+        }
+
+        // Симуляция 30 дней
+        async function runSimulation() {
+            const pairs = createPairs(stores, depot);
+            let accumulatedCost = 0;
+            
+            for (let day = 0; day < 30; day++) {
+                const result = calculateDayCost(pairs, pallets, day);
+                accumulatedCost += result.totalCost;
+                
+                // Обновление UI
+                document.getElementById('currentDay').textContent = day + 1;
+                document.getElementById('trucksToday').textContent = result.trucks;
+                document.getElementById('distToday').textContent = result.totalDist.toFixed(1);
+                document.getElementById('costToday').textContent = formatNumber(result.totalCost);
+                document.getElementById('totalCost').textContent = formatNumber(accumulatedCost) + ' ₽';
+                document.getElementById('progress').textContent = Math.round((day + 1) / 30 * 100);
+                document.getElementById('progressBar').style.width = ((day + 1) / 30 * 100) + '%';
+                
+                // Отрисовка маршрутов только в день 1
+                if (day === 0) {
+                    drawRoutes(result.routes);
+                }
+                
+                // Отправляем результат дня
+                window.parent.postMessage({
+                    type: 'DAY_RESULT',
+                    algorithm: 'pairs',
+                    day: day + 1,
+                    cost: result.totalCost,
+                    trucks: result.trucks,
+                    distance: result.totalDist
+                }, '*');
+                
+                // Задержка (кроме последнего дня)
+                if (day < 29) {
+                    await new Promise(resolve => setTimeout(resolve, 150 / speed));
+                }
+            }
+            
+            // Финальный результат
+            window.parent.postMessage({
+                type: 'SIMULATION_COMPLETE',
+                algorithm: 'pairs',
+                totalCost: accumulatedCost
+            }, '*');
+        }
+
+        function formatNumber(num) {
+            return Math.round(num).toLocaleString('ru-RU');
+        }
+
+        // Обработка данных от родителя
+        window.addEventListener('message', (event) => {
+            if (event.data.type === 'INIT_SIMULATION') {
+                depot = event.data.depot;
+                stores = event.data.stores;
+                pallets = event.data.pallets;
+                speed = event.data.speed || 5;
+                
+                clearMap();
+                addMarkers();
+                
+                // Запуск симуляции
+                setTimeout(runSimulation, 500);
+            }
+        });
+
+        initMap();
+    </script>
+</body>
+</html>
